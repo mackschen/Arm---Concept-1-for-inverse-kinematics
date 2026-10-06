@@ -19,8 +19,8 @@ clear; clc; close all;
 
 %% ---- Arm parameters (edit these) ----
 arm.L    = [0.40 0.30 0.20 0.05];          % link lengths L1 L2 L3 L4 [m] (L4 = gripper)
-arm.qmin = deg2rad([0 -90 -90 -90]); % joint lower limits [rad]
-arm.qmax = deg2rad([ 180  90  90  90]); % joint upper limits [rad]
+arm.qmin = deg2rad([-170 -135 -135 -120]); % joint lower limits [rad]
+arm.qmax = deg2rad([ 170  135  135  120]); % joint upper limits [rad]
 
 %% ---- Dynamic parameters (edit these) ----
 arm.m  = [2.0 1.5 1.0 0.3];                % link masses [kg] (link 4 = gripper)
@@ -34,6 +34,10 @@ arm.lp = arm.L(4);                         % wrist-joint (joint 4)-to-payload-CO
 arm.Ip = 0.002;                            % payload inertia about its own COM [kg m^2]
 arm.g  = [0; -9.81];                       % gravity in the arm's plane [m/s^2]
                                            %   arm in a vertical plane, y up (rover): [0; -9.81]
+
+%% ---- Joint speed/acceleration limits (edit these; used for worst-case torque) ----
+arm.qdmax  = deg2rad([45 45 60 90]);       % max joint speeds [rad/s]
+arm.qddmax = deg2rad([90 90 120 180]);     % max joint accelerations [rad/s^2]
 
 %% ---- Rover mounting (edit these) ----
 % Arm works in a VERTICAL plane: x = forward, y = up.
@@ -103,6 +107,36 @@ for k = 1:4, Mdot = Mdot + dMdq(:,:,k)*qdk(k); end
 N = Mdot - 2*C;
 fprintf('Skew-symmetry check ||N + N''|| = %.2e (should be ~0)\n', norm(N + N.'));
 
+%% ---- Worst-case joint torques ----
+% Searches every pose within the joint limits and clear of the ground and
+% rover body (coarse grid, then refined) for the largest torque each joint
+% can see:
+%   Static  = holding still (gravity only)
+%   Dynamic = gravity + joints moving at up to arm.qdmax and accelerating
+%             at up to arm.qddmax, in the worst combination of directions.
+%             This is a conservative upper bound: a real move rarely hits
+%             full speed and full acceleration on every joint at once.
+% Set arm.mp to the heaviest load the arm will carry.
+wc = worstCaseTorque(arm, mount, 12);      % 12 grid points per joint for the coarse search
+fprintf('\nWorst-case joint torques (payload %.2f kg):\n', arm.mp);
+fprintf('  Joint |  Static [N m] | Dynamic [N m] | Pose for dynamic worst case [deg]\n');
+for i = 1:numel(arm.L)
+    fprintf('    %d   | %12.3f  | %12.3f  | [%s]\n', i, wc.static(i), wc.dyn(i), ...
+            sprintf('%7.1f', rad2deg(wc.qDyn(i,:))));
+end
+
+figure;
+for i = 1:numel(arm.L)
+    subplot(2, ceil(numel(arm.L)/2), i); hold on; axis equal; grid on;
+    plotScene(mount);
+    drawArm(wc.qStatic(i,:), arm, mount, [0.5 0.5 0.5], 1.5, 'on', ...
+            sprintf('Static %.1f N m', wc.static(i)));
+    drawArm(wc.qDyn(i,:), arm, mount, [0.85 0.2 0.1], 2, 'on', ...
+            sprintf('Dynamic %.1f N m', wc.dyn(i)));
+    title(sprintf('Joint %d worst case', i));
+    xlabel('x [m]'); ylabel('Height [m]'); legend('show', 'Location', 'best');
+end
+
 %% ---- Reach envelope on the rover ----
 env = reachEnvelopeArm(arm, mount, 30);    % 30 samples per joint (30^4 poses)
 figure; hold on; axis equal; grid on;
@@ -138,7 +172,7 @@ testStartPref  = 'margin';                 % how to pick the start pose among al
                                            %   'up' / 'down' = elbow (joint 2) up or down
 qStartAngles   = deg2rad([60 -100 -40 -10]); % start joint angles, used if testStartMode = 'angles'
 
-testTf      = 2.0;                         % move duration [s]
+testTf      = 3.0;                         % move duration [s]
 testAnimate = true;                        % play an animation of the move
 
 fprintf('\n--- Test move to (%.3f, %.3f) m at phi = %.1f deg ---\n', ...
@@ -174,6 +208,13 @@ if ~isempty(qGoal)
     sddT = 6/testTf^2 - 12*tT/testTf^3;
     dq   = qGoal - qStart;
     qPath = qStart + sT.' * dq;            % 201 x 4
+
+    % Check the move against the joint speed/acceleration limits
+    % (cubic profile: peak speed = 1.5*dq/Tf, peak accel = 6*dq/Tf^2)
+    TfMin = max([1.5*abs(dq)./arm.qdmax, sqrt(6*abs(dq)./arm.qddmax)]);
+    if testTf < TfMin
+        fprintf('WARNING: move is too fast for the joint speed/accel limits; needs testTf >= %.2f s.\n', TfMin);
+    end
 
     % Collision check along the whole path, not just the endpoints
     pathOK = clearOfObstacles(qPath, arm, mount);
@@ -389,7 +430,7 @@ function [ok, q] = canReachArm(target, arm, mount, nPhi)
     if ok, q = chooseSolution(qAllOK, arm, 'margin'); end
 end
 
-function [M, C, G, dMdq] = dynArm(q, qd, arm)
+function [M, C, G, dMdq, Cs] = dynArm(q, qd, arm)
 % DYNARM  Equation-of-motion terms for the planar n-link arm:
 %           M(q)*qdd + C(q,qd)*qd + G(q) = tau
 %   q, qd : joint angles [rad] and rates [rad/s]
@@ -397,6 +438,8 @@ function [M, C, G, dMdq] = dynArm(q, qd, arm)
 %   C     : n x n Coriolis/centrifugal matrix (Christoffel form)
 %   G     : n x 1 gravity torques
 %   dMdq  : n x n x n, dMdq(:,:,k) = dM/dq_k
+%   Cs    : n x n x n Christoffel symbols, so that the velocity torque on
+%           joint i is sum over j,k of Cs(i,j,k)*qd(j)*qd(k)
     q = q(:); qd = qd(:); n = numel(q);
     a = cumsum(q);                         % absolute link angles
     T = tril(ones(n));                     % a = T*q
@@ -436,11 +479,13 @@ function [M, C, G, dMdq] = dynArm(q, qd, arm)
     end
 
     % Coriolis/centrifugal matrix from Christoffel symbols
+    Cs = zeros(n,n,n);
     C = zeros(n);
     for i = 1:n
         for j = 1:n
             for k = 1:n
-                C(i,j) = C(i,j) + 0.5*(dMdq(i,j,k) + dMdq(i,k,j) - dMdq(j,k,i)) * qd(k);
+                Cs(i,j,k) = 0.5*(dMdq(i,j,k) + dMdq(i,k,j) - dMdq(j,k,i));
+                C(i,j) = C(i,j) + Cs(i,j,k) * qd(k);
             end
         end
     end
@@ -477,6 +522,123 @@ function qdd = fwdDynArm(q, qd, tau, arm) %#ok<DEFNU>
 %   e.g. inside an ode45 right-hand side).
     [M, C, G] = dynArm(q, qd, arm);
     qdd = M \ (tau(:) - C*qd(:) - G);
+end
+
+function wc = worstCaseTorque(arm, mount, N)
+% WORSTCASETORQUE  Largest torque each joint can see, over every pose within
+%   the joint limits and clear of the ground and rover body.
+%   N : grid points per joint for the coarse search (default 12)
+%   wc.static(i), wc.qStatic(i,:) : worst holding torque on joint i and its pose
+%   wc.dyn(i),    wc.qDyn(i,:)    : worst moving torque on joint i and its pose
+%   wc.vDyn(i,:), wc.aDyn(i,:)    : joint speeds and accelerations causing it
+% Method: at each pose, torque_i = M_i*qdd + (velocity terms)_i + G_i.
+%   It is linear in qdd, so its worst value is |velocity + gravity| +
+%   sum_j |M_ij|*qddmax_j. Velocity terms are checked at every combination
+%   of {-qdmax, 0, +qdmax}. The best coarse-grid poses are then refined
+%   with a pattern search that stays within the valid poses.
+    if nargin < 3, N = 12; end
+    n = numel(arm.L);
+
+    % Coarse grid of valid poses (always includes 0 = links in line)
+    g = cell(1, n);
+    for j = 1:n
+        g{j} = linspace(arm.qmin(j), arm.qmax(j), N);
+        if arm.qmin(j) < 0 && arm.qmax(j) > 0, g{j} = unique([g{j} 0]); end
+    end
+    Gd = cell(1, n); [Gd{:}] = ndgrid(g{:});
+    Q = zeros(numel(Gd{1}), n);
+    for j = 1:n, Q(:,j) = Gd{j}(:); end
+    Q = Q(clearOfObstacles(Q, arm, mount), :);
+    if isempty(Q)
+        error('worstCaseTorque: no valid poses found; check limits, mount and rover box.');
+    end
+
+    % Joint speed combinations to test
+    Vd = cell(1, n); [Vd{:}] = ndgrid([-1 0 1]);
+    V = zeros(3^n, n);
+    for j = 1:n, V(:,j) = Vd{j}(:) * arm.qdmax(j); end
+
+    K = size(Q, 1);
+    tS = zeros(K, n); tD = zeros(K, n);
+    for k = 1:K
+        [tS(k,:), tD(k,:)] = poseWorstTorque(Q(k,:), arm, V);
+    end
+
+    % Refine the best few coarse poses for each joint
+    step0 = max(arm.qmax - arm.qmin) / (N - 1);  % start at the grid spacing
+    wc.static = zeros(1,n); wc.dyn = zeros(1,n);
+    wc.qStatic = zeros(n); wc.qDyn = zeros(n);
+    wc.vDyn = zeros(n); wc.aDyn = zeros(n);
+    for i = 1:n
+        for mode = 1:2                     % 1 = static, 2 = dynamic
+            if mode == 1, t = tS(:,i); else, t = tD(:,i); end
+            [~, order] = sort(t, 'descend');
+            bestVal = -inf; bestQ = [];
+            for c = order(1:min(5, K)).'
+                f = @(q) validTorque(q, i, mode, arm, mount, V);
+                [qr, vr] = patternSearchMax(f, Q(c,:), t(c), step0);
+                if vr > bestVal, bestVal = vr; bestQ = qr; end
+            end
+            if mode == 1
+                wc.static(i) = bestVal; wc.qStatic(i,:) = bestQ;
+            else
+                wc.dyn(i) = bestVal; wc.qDyn(i,:) = bestQ;
+                [~, ~, wc.vDyn(i,:), wc.aDyn(i,:)] = poseWorstTorque(bestQ, arm, V, i);
+            end
+        end
+    end
+end
+
+function [x, fx] = patternSearchMax(f, x, fx, step)
+% Maximize f by stepping each joint +/- step, halving the step when no
+% move helps. Invalid poses score 0, so the search never leaves the
+% valid region. Stops when the step is below 0.05 deg.
+    n = numel(x);
+    while step > deg2rad(0.05)
+        improved = false;
+        for j = 1:n
+            for s = [1 -1]
+                xt = x; xt(j) = xt(j) + s*step;
+                ft = f(xt);
+                if ft > fx
+                    x = xt; fx = ft; improved = true;
+                end
+            end
+        end
+        if ~improved, step = step / 2; end
+    end
+end
+
+function t = validTorque(q, i, mode, arm, mount, V)
+% Worst torque on joint i at pose q, or 0 if q is outside the joint limits
+% or collides (so the optimizer stays within the valid poses).
+    if any(q < arm.qmin) || any(q > arm.qmax) || ~clearOfObstacles(q, arm, mount)
+        t = 0; return
+    end
+    [tS, tD] = poseWorstTorque(q, arm, V);
+    if mode == 1, t = tS(i); else, t = tD(i); end
+end
+
+function [tStat, tDyn, vW, aW] = poseWorstTorque(q, arm, V, iOut)
+% Worst static and dynamic torque on each joint at pose q.
+%   V : P x n joint speed combinations to test
+%   vW, aW : speeds and accelerations giving joint iOut's worst dynamic torque
+    n = numel(q);
+    [M, ~, Gv, ~, Cs] = dynArm(q, zeros(1,n), arm);
+    tStat = abs(Gv).';
+    tDyn = zeros(1, n);
+    vW = zeros(1, n); aW = zeros(1, n);
+    for i = 1:n
+        Ai = reshape(Cs(i,:,:), n, n);
+        h = Gv(i) + sum((V*Ai) .* V, 2);   % gravity + velocity torque, per speed combination
+        [hMax, p] = max(abs(h));
+        tDyn(i) = hMax + abs(M(i,:)) * arm.qddmax(:);
+        if nargin > 3 && i == iOut
+            vW = V(p,:);
+            sh = sign(h(p)); if sh == 0, sh = 1; end
+            aW = sh * sign(M(i,:)) .* arm.qddmax;
+        end
+    end
 end
 
 function [ok, X, Y] = clearOfObstacles(q, arm, mount)
