@@ -37,7 +37,7 @@ The joints, from the base out:
 
 ### How the joint angles are measured
 
-![Joint angle definitions](joint_angles_4dof.png)
+![Joint angle definitions](joint_angles.png)
 
 - **Joint 1 (θ1)** is measured from horizontal (forward along the ground).
 - **Joints 2, 3 and 4 (θ2, θ3, θ4)** are measured relative to the link before them. 0° means the link is in line with the previous link.
