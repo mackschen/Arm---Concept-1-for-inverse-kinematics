@@ -35,7 +35,7 @@ The joints, from the base out:
 |---|---|---|
 | 1 | Base | Rover to link 1 |
 | 2 | Elbow | Link 1 to link 2 |
-| 3 | Added joint | Link 2 to link 3 |
+| 3 | joint 3 | Link 2 to link 3 |
 | 4 | Wrist | Link 3 to link 4 (gripper) |
 
 ### How the joint angles are measured
