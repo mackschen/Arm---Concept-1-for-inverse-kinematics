@@ -27,7 +27,7 @@ From the parameters, the script generates:
 
 ### How the joint angles are measured
 
-![Joint angle definitions](3_Joint_Code_Max/joint_angle_definitions.png)
+![Joint angle definitions](joint_angle_definitions.png)
 
 - **Joint 1 (θ1)** is measured from horizontal (forward along the ground).
 - **Joint 2 (θ2)** and **joint 3 (θ3)** are measured relative to the link before them (the dashed lines). 0° means the link is in line with the previous link.
